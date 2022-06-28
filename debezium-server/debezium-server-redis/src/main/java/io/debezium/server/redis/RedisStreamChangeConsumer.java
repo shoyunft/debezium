@@ -31,6 +31,7 @@ import io.debezium.server.BaseChangeConsumer;
 import io.debezium.util.DelayStrategy;
 
 import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisCluster;
 import redis.clients.jedis.Pipeline;
 import redis.clients.jedis.StreamEntryID;
 import redis.clients.jedis.exceptions.JedisConnectionException;
@@ -53,10 +54,13 @@ public class RedisStreamChangeConsumer extends BaseChangeConsumer
     private static final String PROP_ADDRESS = PROP_PREFIX + "address";
     private static final String PROP_USER = PROP_PREFIX + "user";
     private static final String PROP_PASSWORD = PROP_PREFIX + "password";
+    private static final String PROP_MODE = PROP_PREFIX + "mode";
 
     private String address;
     private String user;
     private String password;
+    private String redisMode;
+    private boolean isClusterMode;
 
     @ConfigProperty(name = PROP_PREFIX + "ssl.enabled", defaultValue = "false")
     boolean sslEnabled;
@@ -77,6 +81,7 @@ public class RedisStreamChangeConsumer extends BaseChangeConsumer
     String nullValue;
 
     private Jedis client = null;
+    private JedisCluster cluster = null;
 
     @PostConstruct
     void connect() {
@@ -84,15 +89,22 @@ public class RedisStreamChangeConsumer extends BaseChangeConsumer
         address = config.getValue(PROP_ADDRESS, String.class);
         user = config.getOptionalValue(PROP_USER, String.class).orElse(null);
         password = config.getOptionalValue(PROP_PASSWORD, String.class).orElse(null);
+        redisMode = config.getValue(PROP_MODE, String.class); // single | cluster
+
+        isClusterMode = redisMode.equals("cluster");
 
         RedisConnection redisConnection = new RedisConnection(address, user, password, sslEnabled);
-        client = redisConnection.getRedisClient(RedisConnection.DEBEZIUM_REDIS_SINK_CLIENT_NAME);
+        if (!isClusterMode) {
+            client = redisConnection.getRedisClient(RedisConnection.DEBEZIUM_REDIS_SINK_CLIENT_NAME);
+        } else {
+            cluster = redisConnection.getRedisClusterNodes(address);
+        }
     }
 
     @PreDestroy
     void close() {
         try {
-            if (client != null) {
+            if (client != null && !isClusterMode) {
                 client.close();
             }
         }
@@ -101,6 +113,7 @@ public class RedisStreamChangeConsumer extends BaseChangeConsumer
         }
         finally {
             client = null;
+            cluster = null;
         }
     }
 
@@ -119,10 +132,79 @@ public class RedisStreamChangeConsumer extends BaseChangeConsumer
                 n -> source.subList(n * length, n == fullChunks ? size : (n + 1) * length));
     }
 
-    @Override
-    public void handleBatch(List<ChangeEvent<Object, Object>> records,
-                            RecordCommitter<ChangeEvent<Object, Object>> committer)
-            throws InterruptedException {
+    private void handleClusterBatch(List<ChangeEvent<Object, Object>> records,
+                                    RecordCommitter<ChangeEvent<Object, Object>> committer)  {
+        DelayStrategy delayStrategy = DelayStrategy.exponential(initialRetryDelay, maxRetryDelay);
+
+        LOGGER.trace("Handling a batch of {} records", records.size());
+        batches(records, batchSize).forEach(batch -> {
+            boolean completedSuccessfully = false;
+
+            // Clone the batch and remove the records that have been successfully processed.
+            // Move to the next batch once this list is empty.
+            List<ChangeEvent<Object, Object>> clonedBatch = batch.stream().collect(Collectors.toList());
+
+            // As long as we failed to execute the current batch to the stream, we should retry if the reason was either a connection error or OOM in Redis.
+            while (!completedSuccessfully) {
+                if (cluster == null) {
+                    // Try to reconnect
+                    try {
+                        connect();
+                        continue; // Managed to establish a new connection to Redis, avoid a redundant retry
+                    } catch (Exception e) {
+                        close();
+                        LOGGER.error("Can't connect to Redis cluster nodes", e);
+                    }
+                } else {
+                    try {
+                        LOGGER.trace("Preparing Redis cluster nodes of {} records", clonedBatch.size());
+
+                        List<ChangeEvent<Object, Object>> processedRecords = new ArrayList<ChangeEvent<Object, Object>>();
+
+                        // Add the batch records to the stream(s) via Pipeline
+                        for (ChangeEvent<Object, Object> record : clonedBatch) {
+                            String destination = streamNameMapper.map(record.destination());
+                            String key = (record.key() != null) ? getString(record.key()) : nullKey;
+                            String value = (record.value() != null) ? getString(record.value()) : nullValue;
+
+                            // Add the record to the destination stream
+                            LOGGER.info("XADD VIA CLUSTER... '{}'", record);
+                            cluster.xadd(destination, StreamEntryID.NEW_ENTRY, Collections.singletonMap(key, value));
+                            committer.markProcessed(record);
+                            processedRecords.add(record);
+                        }
+
+                        clonedBatch.removeAll(processedRecords);
+
+                        if (clonedBatch.size() == 0) {
+                            completedSuccessfully = true;
+                        }
+                    } catch (JedisConnectionException jce) {
+                        LOGGER.error("Connection error", jce);
+                        close();
+                    } catch (JedisDataException jde) {
+                        // When Redis is starting, a JedisDataException will be thrown with this message.
+                        // We will retry communicating with the target DB as once of the Redis is available, this message will be gone.
+                        if (jde.getMessage().equals("LOADING Redis cluster is loading the dataset in memory")) {
+                            LOGGER.error("Redis cluster is starting", jde);
+                        } else {
+                            LOGGER.error("Unexpected JedisDataException", jde);
+                            throw new DebeziumException(jde);
+                        }
+                    } catch (Exception e) {
+                        LOGGER.error("Unexpected Exception", e);
+                        throw new DebeziumException(e);
+                    }
+                }
+
+                // Failed to execute the transaction, retry...
+                delayStrategy.sleepWhen(!completedSuccessfully);
+            }
+        });
+    }
+
+    private void handleClientBatch(List<ChangeEvent<Object, Object>> records,
+                                   RecordCommitter<ChangeEvent<Object, Object>> committer) {
         DelayStrategy delayStrategy = DelayStrategy.exponential(initialRetryDelay, maxRetryDelay);
 
         LOGGER.trace("Handling a batch of {} records", records.size());
@@ -140,13 +222,11 @@ public class RedisStreamChangeConsumer extends BaseChangeConsumer
                     try {
                         connect();
                         continue; // Managed to establish a new connection to Redis, avoid a redundant retry
-                    }
-                    catch (Exception e) {
+                    } catch (Exception e) {
                         close();
                         LOGGER.error("Can't connect to Redis", e);
                     }
-                }
-                else {
+                } else {
                     Pipeline pipeline;
                     try {
                         LOGGER.trace("Preparing a Redis Pipeline of {} records", clonedBatch.size());
@@ -179,8 +259,7 @@ public class RedisStreamChangeConsumer extends BaseChangeConsumer
                             // of evicting elements from the stream by the target DB.
                             if (message.contains("OOM command not allowed when used memory > 'maxmemory'")) {
                                 totalOOMResponses++;
-                            }
-                            else {
+                            } else {
                                 // Mark the record as processed
                                 ChangeEvent<Object, Object> currentRecord = clonedBatch.get(index);
                                 committer.markProcessed(currentRecord);
@@ -199,23 +278,19 @@ public class RedisStreamChangeConsumer extends BaseChangeConsumer
                         if (clonedBatch.size() == 0) {
                             completedSuccessfully = true;
                         }
-                    }
-                    catch (JedisConnectionException jce) {
+                    } catch (JedisConnectionException jce) {
                         LOGGER.error("Connection error", jce);
                         close();
-                    }
-                    catch (JedisDataException jde) {
+                    } catch (JedisDataException jde) {
                         // When Redis is starting, a JedisDataException will be thrown with this message.
                         // We will retry communicating with the target DB as once of the Redis is available, this message will be gone.
                         if (jde.getMessage().equals("LOADING Redis is loading the dataset in memory")) {
                             LOGGER.error("Redis is starting", jde);
-                        }
-                        else {
+                        } else {
                             LOGGER.error("Unexpected JedisDataException", jde);
                             throw new DebeziumException(jde);
                         }
-                    }
-                    catch (Exception e) {
+                    } catch (Exception e) {
                         LOGGER.error("Unexpected Exception", e);
                         throw new DebeziumException(e);
                     }
@@ -225,8 +300,15 @@ public class RedisStreamChangeConsumer extends BaseChangeConsumer
                 delayStrategy.sleepWhen(!completedSuccessfully);
             }
         });
+    }
 
-        // Mark the whole batch as finished once the sub batches completed
-        committer.markBatchFinished();
+    @Override
+    public void handleBatch(List<ChangeEvent<Object, Object>> records,
+                            RecordCommitter<ChangeEvent<Object, Object>> committer) {
+        if (!isClusterMode) {
+            handleClientBatch(records, committer);
+        } else {
+            handleClusterBatch(records, committer);
+        }
     }
 }

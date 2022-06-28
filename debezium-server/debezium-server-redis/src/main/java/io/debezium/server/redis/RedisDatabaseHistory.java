@@ -32,6 +32,7 @@ import io.debezium.util.Collect;
 import io.debezium.util.DelayStrategy;
 
 import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisCluster;
 import redis.clients.jedis.StreamEntryID;
 import redis.clients.jedis.exceptions.JedisConnectionException;
 import redis.clients.jedis.resps.StreamEntry;
@@ -49,6 +50,9 @@ public final class RedisDatabaseHistory extends AbstractDatabaseHistory {
 
     public static final Field PROP_ADDRESS = Field.create(CONFIGURATION_FIELD_PREFIX_STRING + "address")
             .withDescription("The redis url that will be used to access the database history");
+
+    public static final Field PROP_MODE = Field.create(CONFIGURATION_FIELD_PREFIX_STRING + "mode")
+            .withDescription("The redis mode. Can be single or cluster.");
 
     public static final Field PROP_SSL_ENABLED = Field.create(CONFIGURATION_FIELD_PREFIX_STRING + "ssl.enabled")
             .withDescription("Use SSL for Redis connection")
@@ -90,13 +94,21 @@ public final class RedisDatabaseHistory extends AbstractDatabaseHistory {
     private String address;
     private String user;
     private String password;
+    private String redisMode;
     private boolean sslEnabled;
+    private boolean isClusterEnabled;
 
     private Jedis client = null;
 
+    private JedisCluster cluster = null;
+
     void connect() {
         RedisConnection redisConnection = new RedisConnection(this.address, this.user, this.password, this.sslEnabled);
-        client = redisConnection.getRedisClient(RedisConnection.DEBEZIUM_DB_HISTORY);
+        if (!this.isClusterEnabled) {
+            client = redisConnection.getRedisClient(RedisConnection.DEBEZIUM_DB_HISTORY);
+        } else {
+            cluster = redisConnection.getRedisClusterNodes(this.address);
+        }
     }
 
     @Override
@@ -115,6 +127,7 @@ public final class RedisDatabaseHistory extends AbstractDatabaseHistory {
             this.user = this.config.getString(SINK_PROP_PREFIX + "user");
             this.password = this.config.getString(SINK_PROP_PREFIX + "password");
             this.sslEnabled = Boolean.parseBoolean(this.config.getString(SINK_PROP_PREFIX + "ssl.enabled"));
+            this.isClusterEnabled = this.config.getString(SINK_PROP_PREFIX + "mode").equals("cluster");
         }
         else {
             this.user = this.config.getString(PROP_USER.name());
@@ -137,8 +150,7 @@ public final class RedisDatabaseHistory extends AbstractDatabaseHistory {
         this.connect();
     }
 
-    @Override
-    protected void storeRecord(HistoryRecord record) throws DatabaseHistoryException {
+    private void storeClientRecord(HistoryRecord record) throws DatabaseHistoryException {
         if (record == null) {
             return;
         }
@@ -182,17 +194,69 @@ public final class RedisDatabaseHistory extends AbstractDatabaseHistory {
         }
     }
 
+    private void storeClusterRecord(HistoryRecord record) throws DatabaseHistoryException {
+        if (record == null) {
+            return;
+        }
+        String line;
+        try {
+            line = writer.write(record.document());
+        }
+        catch (IOException e) {
+            LOGGER.error("Failed to convert record to string: {}", record, e);
+            throw new DatabaseHistoryException("Unable to write database history record");
+        }
+
+        DelayStrategy delayStrategy = DelayStrategy.exponential(initialRetryDelay, maxRetryDelay);
+        boolean completedSuccessfully = false;
+
+        // loop and retry until successful
+        while (!completedSuccessfully) {
+            try {
+                if (cluster == null) {
+                    this.connect();
+                }
+
+                // write the entry to Redis
+                cluster.xadd(this.redisKeyName, (StreamEntryID) null, Collections.singletonMap("schema", line));
+                LOGGER.trace("Record written to database history in redis: " + line);
+                completedSuccessfully = true;
+            }
+            catch (JedisConnectionException jce) {
+                LOGGER.warn("Attempting to reconnect to redis ");
+                this.connect();
+            }
+            catch (Exception e) {
+                LOGGER.warn("Writing to database history stream failed", e);
+                LOGGER.warn("Will retry");
+            }
+            if (!completedSuccessfully) {
+                // Failed to execute the transaction, retry...
+                delayStrategy.sleepWhen(!completedSuccessfully);
+            }
+
+        }
+    }
+
+    @Override
+    protected void storeRecord(HistoryRecord record) throws DatabaseHistoryException {
+        if (!this.isClusterEnabled) {
+            storeClientRecord(record);
+        } else {
+            storeClusterRecord(record);
+        }
+    }
+
     @Override
     public void stop() {
         running.set(false);
-        if (client != null) {
+        if (client != null && !this.isClusterEnabled) {
             client.disconnect();
         }
         super.stop();
     }
 
-    @Override
-    protected synchronized void recoverRecords(Consumer<HistoryRecord> records) {
+    private void recoverClientRecords(Consumer<HistoryRecord> records) {
         DelayStrategy delayStrategy = DelayStrategy.exponential(initialRetryDelay, maxRetryDelay);
         boolean completedSuccessfully = false;
         List<StreamEntry> entries = new ArrayList<StreamEntry>();
@@ -233,7 +297,58 @@ public final class RedisDatabaseHistory extends AbstractDatabaseHistory {
                 return;
             }
         }
+    }
 
+    private void recoverClusterRecords(Consumer<HistoryRecord> records) {
+        DelayStrategy delayStrategy = DelayStrategy.exponential(initialRetryDelay, maxRetryDelay);
+        boolean completedSuccessfully = false;
+        List<StreamEntry> entries = new ArrayList<StreamEntry>();
+
+        // loop and retry until successful
+        while (!completedSuccessfully) {
+            try {
+                if (client == null) {
+                    this.connect();
+                }
+
+                // read the entries from Redis
+                entries = cluster.xrange(
+                        this.redisKeyName, (StreamEntryID) null, (StreamEntryID) null);
+                completedSuccessfully = true;
+            }
+            catch (JedisConnectionException jce) {
+                LOGGER.warn("Attempting to reconnect to redis ");
+                this.connect();
+            }
+            catch (Exception e) {
+                LOGGER.warn("Reading from database history stream failed with " + e);
+                LOGGER.warn("Will retry");
+            }
+            if (!completedSuccessfully) {
+                // Failed to execute the transaction, retry...
+                delayStrategy.sleepWhen(!completedSuccessfully);
+            }
+
+        }
+
+        for (StreamEntry item : entries) {
+            try {
+                records.accept(new HistoryRecord(reader.read(item.getFields().get("schema"))));
+            }
+            catch (IOException e) {
+                LOGGER.error("Failed to convert record to string: {}", item, e);
+                return;
+            }
+        }
+    }
+
+    @Override
+    protected synchronized void recoverRecords(Consumer<HistoryRecord> records) {
+        if (!this.isClusterEnabled) {
+            recoverClientRecords(records);
+        } else {
+            recoverClusterRecords(records);
+        }
     }
 
     @Override
@@ -244,7 +359,7 @@ public final class RedisDatabaseHistory extends AbstractDatabaseHistory {
     @Override
     public boolean exists() {
         // check if the stream is not empty
-        if (client != null && client.xlen(this.redisKeyName) > 0) {
+        if (client != null && client.xlen(this.redisKeyName) > 0 && !this.isClusterEnabled) {
             return true;
         }
         else {

@@ -10,7 +10,12 @@ import org.slf4j.LoggerFactory;
 
 import redis.clients.jedis.HostAndPort;
 import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisCluster;
 import redis.clients.jedis.exceptions.JedisDataException;
+
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
 
 /**
  * Establishes a new connection to Redis
@@ -60,6 +65,30 @@ public class RedisConnection {
         }
 
         LOGGER.info("Using Jedis '{}'", client);
+
+        return client;
+    }
+
+    public JedisCluster getRedisClusterNodes(String nodes) {
+        if (nodes == null) {
+            return null;
+        }
+
+        Set<HostAndPort> jedisClusterNodes = new HashSet();
+
+        Arrays.stream(nodes.split(",")).forEach(node -> {
+            try {
+                String host = node.split(":")[0];
+                int port = Integer.parseInt(node.split(":")[1]);
+
+                jedisClusterNodes.add(new HostAndPort(host, port));
+            } catch (Exception e) {
+                LOGGER.warn("Failed to add cluster nodes", e);
+            }
+        });
+
+        JedisCluster client = new JedisCluster(jedisClusterNodes);
+        LOGGER.info("Using JedisCluster '{}'", client);
 
         return client;
     }
